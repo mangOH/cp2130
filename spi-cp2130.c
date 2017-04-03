@@ -829,43 +829,60 @@ static int cp2130_spi_transfer_one_message(struct spi_master *master,
 		   is issued', so there is no advantage from using the
 		   async USB API */
 
+		/*
+		 * TODO: The driver doesn't check the len output parameter in
+		 * calls to usb_bulk_msg(). This output parameter indicates how
+		 * many bytes were actually transferred. This is important
+		 * because I believe the CP2130 is limited to 64 byte transfers
+		 * which implies a write payload of 56 bytes.
+		 */
                 if (xfer->tx_buf && xfer->rx_buf) {
+			/* Simultaneous SPI write and read */
+			int usb_msg_len = CP2130_BULK_OFFSET_DATA + xfer->len;
 			urb[CP2130_BULK_OFFSET_CMD] = CP2130_CMD_WRITEREAD;
-			/* usb write */
 			ret = usb_bulk_msg(dev->udev, xmit_pipe, urb,
-					   CP2130_BULK_OFFSET_DATA + xfer->len,
-					   &len, 200);
-			dev_dbg(&master->dev, "usb write %d", ret);
+					   usb_msg_len, &len, 200);
+			dev_dbg(&master->dev,
+				"write-read - usb write phase: ret=%d, wrote %d/%d",
+				ret, len, usb_msg_len);
 			if (ret)
 				goto err;
-			/* usb read */
 			ret = usb_bulk_msg(dev->udev, recv_pipe,
 					   xfer->rx_buf, xfer->len,
 					   &len, 200);
-			dev_dbg(&master->dev, "usb read %d", ret);
+			dev_dbg(&master->dev,
+				"write-read - usb read phase: ret=%d, read %d/%d",
+				ret, len, xfer->len);
 			if (ret)
 				goto err;
-		} else if (!xfer->rx_buf) {
-			/* prepare URB and submit sync */
+		} else if (xfer->tx_buf) {
+			/* SPI write */
+			int usb_msg_len = CP2130_BULK_OFFSET_DATA + xfer->len;
 			urb[CP2130_BULK_OFFSET_CMD] = CP2130_CMD_WRITE;
-			/* usb write */
 			ret = usb_bulk_msg(dev->udev, xmit_pipe, urb,
-					   CP2130_BULK_OFFSET_DATA + xfer->len,
-					   &len, 200);
+					   usb_msg_len, &len, 200);
+			dev_dbg(&master->dev,
+				"write - usb write phase: ret=%d, wrote %d/%d",
+				ret, len, usb_msg_len);
 			if (ret)
 				goto err;
-		} else if (!xfer->tx_buf) {
-			/* prepare URB and submit sync */
+		} else if (xfer->rx_buf) {
+			/* SPI read */
+			int usb_msg_len = CP2130_BULK_OFFSET_DATA;
 			urb[CP2130_BULK_OFFSET_CMD] = CP2130_CMD_READ;
-			/* usb write */
 			ret = usb_bulk_msg(dev->udev, xmit_pipe, urb,
-					   CP2130_BULK_OFFSET_DATA,
+					   usb_msg_len,
 					   &len, 200);
+			dev_dbg(&master->dev,
+				"read - usb write phase: ret=%d, wrote %d/%d",
+				ret, len, usb_msg_len);
 			if (ret)
 				goto err;
-			/* usb read */
 			ret = usb_bulk_msg(dev->udev, recv_pipe, xfer->rx_buf,
 					   xfer->len, &len, 200);
+			dev_dbg(&master->dev,
+				"read - usb read phase: ret=%d, read %d/%d",
+				ret, len, xfer->len);
 			if (ret)
 				goto err;
 		}
