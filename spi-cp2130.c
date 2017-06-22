@@ -865,7 +865,7 @@ static int cp2130_spi_transfer_one_message(struct spi_master *master,
 	if (spi_mesg_does_rx) {
 		usb_rx_buffer_len = spi_mesg_len;
 		usb_rx_buffer = kzalloc(usb_rx_buffer_len, GFP_KERNEL);
-		if (usb_tx_buffer == NULL) {
+		if (usb_rx_buffer == NULL) {
 			ret = -ENOMEM;
 			goto err;
 		}
