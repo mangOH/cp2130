@@ -30,32 +30,66 @@
 #include <linux/gpio.h>
 #include <linux/version.h>
 
-#define USB_DEVICE_ID_CP2130         0x87a0
-#define USB_VENDOR_ID_CYGNAL         0x10c4
+#define USB_DEVICE_ID_CP2130                   0x87a0
+#define USB_VENDOR_ID_CYGNAL                   0x10c4
 
-#define CP2130_NUM_GPIOS             11
-#define CP2130_IRQ_POLL_INTERVAL     1 * 1000 * 1000 /* us */
+#define CP2130_NUM_GPIOS                       11
+#define CP2130_IRQ_POLL_INTERVAL               1 * 1000 * 1000 /* us */
 
-#define CP2130_CMD_READ              0x00
-#define CP2130_CMD_WRITE             0x01
-#define CP2130_CMD_WRITEREAD         0x02
-#define CP2130_BULK_OFFSET_CMD       2
-#define CP2130_BULK_OFFSET_LENGTH    4
-#define CP2130_BULK_OFFSET_DATA      8
+/* bulk command IDs */
+#define CP2130_CMD_READ                        0x00
+#define CP2130_CMD_WRITE                       0x01
+#define CP2130_CMD_WRITEREAD                   0x02
+#define CP2130_CMD_READ_WITH_RTR               0x04
 
-#define CP2130_BREQ_GET_GPIO_VALUES  0x20
-#define CP2130_BREQ_SET_GPIO_MODE    0x23
-#define CP2130_BREQ_GET_GPIO_CS      0x24
-#define CP2130_BREQ_SET_GPIO_CS      0x25
-#define CP2130_BREQ_GET_SPI_WORD     0x30
-#define CP2130_BREQ_SET_SPI_WORD     0x31
-#define CP2130_BREQ_GET_SPI_DELAY    0x32
-#define CP2130_BREQ_SET_SPI_DELAY    0x33
-#define CP2130_BREQ_GET_LOCK_BYTE    0x6E
-#define CP2130_BREQ_GET_PIN_CONFIG   0x6C
-#define CP2130_BREQ_SET_PIN_CONFIG   0x6D
+/* bulk out transfer offsets */
+#define CP2130_BULK_OFFSET_CMD                 2
+#define CP2130_BULK_OFFSET_LENGTH              4
+#define CP2130_BULK_OFFSET_DATA                8
 
-#define CP2130_BREQ_MEMORY_KEY       0xA5F1
+/* configuration and control commands */
+#define CP2130_BREQ_RESET_DEVICE               0x10
+#define CP2130_BREQ_GET_READ_ONLY_VERSION      0x11
+#define CP2130_BREQ_GET_GPIO_VALUES            0x20
+#define CP2130_BREQ_SET_GPIO_VALUES            0x21
+#define CP2130_BREQ_GET_GPIO_MODE_AND_LEVEL    0x22
+#define CP2130_BREQ_SET_GPIO_MODE              0x23
+#define CP2130_BREQ_GET_GPIO_CS                0x24
+#define CP2130_BREQ_SET_GPIO_CS                0x25
+#define CP2130_BREQ_GET_SPI_WORD               0x30
+#define CP2130_BREQ_SET_SPI_WORD               0x31
+#define CP2130_BREQ_GET_SPI_DELAY              0x32
+#define CP2130_BREQ_SET_SPI_DELAY              0x33
+#define CP2130_BREQ_GET_FULL_THRESHOLD         0x35
+#define CP2130_BREQ_SET_FULL_THRESHOLD         0x35
+#define CP2130_BREQ_GET_RTR_STATE              0x36
+#define CP2130_BREQ_SET_RTR_STOP               0x37
+#define CP2130_BREQ_GET_EVENT_COUNTER          0x44
+#define CP2130_BREQ_SET_EVENT_COUNTER          0x45
+#define CP2130_BREQ_GET_CLOCK_DIVIDER          0x46
+#define CP2130_BREQ_SET_CLOCK_DIVIDER          0x47
+
+/* OTP ROM configuration commands */
+#define CP2130_BREQ_GET_USB_CONFIG             0x60
+#define CP2130_BREQ_SET_USB_CONFIG             0x61
+#define CP2130_BREQ_GET_MANUFACTURING_STRING_1 0x62
+#define CP2130_BREQ_SET_MANUFACTURING_STRING_1 0x63
+#define CP2130_BREQ_GET_MANUFACTURING_STRING_2 0x64
+#define CP2130_BREQ_SET_MANUFACTURING_STRING_2 0x65
+#define CP2130_BREQ_GET_PRODUCT_STRING_1       0x66
+#define CP2130_BREQ_SET_PRODUCT_STRING_1       0x67
+#define CP2130_BREQ_GET_PRODUCT_STRING_2       0x68
+#define CP2130_BREQ_SET_PRODUCT_STRING_2       0x69
+#define CP2130_BREQ_GET_SERIAL_STRING          0x6A
+#define CP2130_BREQ_SET_SERIAL_STRING          0x6B
+#define CP2130_BREQ_GET_PIN_CONFIG             0x6C
+#define CP2130_BREQ_SET_PIN_CONFIG             0x6D
+#define CP2130_BREQ_GET_LOCK_BYTE              0x6E
+#define CP2130_BREQ_SET_LOCK_BYTE              0x6F
+#define CP2130_BREQ_GET_PROM_CONFIG            0x70
+#define CP2130_BREQ_SET_PROM_CONFIG            0x71
+
+#define CP2130_WVAL_SET_LOCK_BYTE_MEMORY_KEY   0xA5F1
 
 /* cp2130 attached chip */
 struct cp2130_channel {
@@ -1192,7 +1226,7 @@ static void cp2130_update_otprom(struct work_struct *work)
                 dev->udev, xmit_pipe,
                 CP2130_BREQ_SET_PIN_CONFIG,
                 USB_TYPE_VENDOR | USB_RECIP_DEVICE | USB_DIR_OUT,
-                CP2130_BREQ_MEMORY_KEY, 0,
+                CP2130_WVAL_SET_LOCK_BYTE_MEMORY_KEY, 0,
                 urb, 0x14, 200);
 
         if (ret)
