@@ -52,7 +52,7 @@
 #define CP2130_BREQ_GET_READ_ONLY_VERSION      0x11
 #define CP2130_BREQ_GET_GPIO_VALUES            0x20
 #define CP2130_BREQ_SET_GPIO_VALUES            0x21
-#define CP2130_BREQ_GET_GPIO_MODE_AND_LEVEL    0x22
+#define CP2130_BREQ_GET_GPIO_MODE              0x22
 #define CP2130_BREQ_SET_GPIO_MODE              0x23
 #define CP2130_BREQ_GET_GPIO_CS                0x24
 #define CP2130_BREQ_SET_GPIO_CS                0x25
@@ -93,18 +93,34 @@
 
 /* cp2130 attached chip */
 struct cp2130_channel {
+	/*
+	 * Has a channel update been requested?
+	 *   0 -> update never requested
+	 *   1 -> update requested
+	 *   2 -> update completed
+	 */
 	int updated;
-	int cs_en; /* chip-select enable mode */
+	/*
+	 * chip-select enable mode
+	 *   0 -> disabled
+	 *   1 -> enabled during SPI transfers
+	 *   2 -> enabled during SPI transfers; all other CS disabled
+	 */
+	int cs_en;
+	/*
+	 * GPIO pin number to use as an IRQ for this channel. TODO: It seems
+	 * limiting that only GPIOs on the cp2130 can be used.
+	 */
 	int irq_pin;
 	int clock_phase;
 	int polarity;
-	int cs_pin_mode;
+	int cs_pin_mode; /* 0 -> open-drain, 1 -> push-pull */
 	int clock_freq; /* spi clock frequency */
-	int delay_mask; /* cs enable, pre-deassert,
-			   post assert and inter-byte delay enable */
-	int inter_byte_delay;
-	int pre_deassert_delay;
-	int post_assert_delay;
+	u8 delay_mask; /* cs enable, pre-deassert, post assert and inter-byte
+			  delay enable */
+	u16 inter_byte_delay;
+	u16 pre_deassert_delay;
+	u16 post_assert_delay;
 	char *modalias;
 	void *pdata;
 	struct spi_device *chip;
@@ -112,13 +128,13 @@ struct cp2130_channel {
 
 /* cp2130 OTP ROM */
 struct cp2130_otprom {
-	int lock_byte;
-	int pin_config[CP2130_NUM_GPIOS];
-	int suspend_level;
-	int suspend_mode;
-	int wakeup_mask;
-	int wakeup_match;
-	int divider;
+	u16 lock_byte;
+	u8 pin_config[CP2130_NUM_GPIOS];
+	u16 suspend_level;
+	u16 suspend_mode;
+	u16 wakeup_mask;
+	u16 wakeup_match;
+	u8 divider;
 };
 
 struct cp2130_gpio_irq {
@@ -142,6 +158,7 @@ struct cp2130_device {
 	struct work_struct read_chn_config;
 	struct work_struct update_otprom;
 	struct work_struct read_otprom;
+
 	struct cp2130_channel chn_configs[CP2130_NUM_GPIOS];
 	struct cp2130_otprom otprom_config;
 
@@ -398,33 +415,23 @@ static int channel_config_store(struct device *dev,
 				goto out;
 			break;
 		case 7: /* delay mask */
-			ret = kstrtoint(pos, 10, &chn.delay_mask);
-			ret |= (chn.delay_mask < 0 || chn.delay_mask > 15) ?
-				-EINVAL : 0;
+			ret = kstrtou8(pos, 10, &chn.delay_mask);
+			ret |= (chn.delay_mask & 0xF0) ? -EINVAL : 0;
 			if (ret)
 				goto out;
 			break;
 		case 8: /* inter-byte delay */
-			ret = kstrtoint(pos, 10, &chn.inter_byte_delay);
-			ret |= (chn.inter_byte_delay < 0 ||
-				chn.inter_byte_delay > 0xffff) ?
-				-EINVAL : 0;
+			ret = kstrtou16(pos, 10, &chn.inter_byte_delay);
 			if (ret)
 				goto out;
 			break;
 		case 9: /* pre-deassert delay */
-			ret = kstrtoint(pos, 10, &chn.pre_deassert_delay);
-			ret |= (chn.pre_deassert_delay < 0 ||
-				chn.pre_deassert_delay > 0xffff) ?
-				-EINVAL : 0;
+			ret = kstrtou16(pos, 10, &chn.pre_deassert_delay);
 			if (ret)
 				goto out;
 			break;
 		case 10: /* post-assert delay */
-			ret = kstrtoint(pos, 10, &chn.post_assert_delay);
-			ret |= (chn.post_assert_delay < 0 ||
-				chn.post_assert_delay > 0xffff) ?
-				-EINVAL : 0;
+			ret = kstrtou16(pos, 10, &chn.post_assert_delay);
 			if (ret)
 				goto out;
 			break;
@@ -575,11 +582,19 @@ static ssize_t otp_rom_show(struct device *dev,
 
 	mutex_lock(&chip->otprom_lock);
 
-	ret = sprintf(out, "OTP lock status (ro):"
-		      "\nvid\t\tpid\t\tmax_power\tpower_mode"
-		      "\tversion\t\tmanu_2\t\tmanu_1"
-		      "\t\tpriority\tproduct_1\tproduct_2\tserial"
-		      "\t\tpin_config\n");
+        ret = sprintf(out, "OTP lock status (ro):\n"
+		      "vid\t\t"
+		      "pid\t\t"
+		      "max_power\t"
+		      "power_mode\t"
+		      "version\t\t"
+		      "manu_2\t\t"
+		      "manu_1\t\t"
+		      "priority\t"
+		      "product_1\t"
+		      "product_2\t"
+		      "serial\t\t"
+		      "pin_config\n");
 	strcat(buf, out);
 	for (i = 0; i < 12; i++) {
 		if (!!((chip->otprom_config.lock_byte >> i) & 1))
@@ -1022,7 +1037,7 @@ static int cp2130_irq_from_pin(struct cp2130_device *dev, int pin)
 static void cp2130_update_channel_config(struct work_struct *work)
 {
 	int i;
-	char urb[8];
+	u8 urb[8];
 	int ret;
 	unsigned int xmit_pipe;
 	struct cp2130_device *dev = container_of(work,
@@ -1144,7 +1159,7 @@ error:
 static void cp2130_read_channel_config(struct work_struct *work)
 {
 	int i;
-	char urb[32];
+	u8 urb[32];
 	int ret;
 	unsigned int recv_pipe;
 	struct cp2130_device *dev = container_of(work,
@@ -1191,12 +1206,9 @@ static void cp2130_read_channel_config(struct work_struct *work)
 		chn = &dev->chn_configs[i];
 
 		chn->delay_mask = urb[1];
-		chn->inter_byte_delay = urb[2] << 8;
-		chn->inter_byte_delay |= urb[2] & 0xff;
-		chn->post_assert_delay = urb[3] << 8;
-		chn->post_assert_delay |= urb[4] & 0xff;
-		chn->pre_deassert_delay = urb[5] << 8;
-		chn->pre_deassert_delay |= urb[6] & 0xff;
+		chn->inter_byte_delay   = ((urb[2] << 8) | urb[3]);
+		chn->post_assert_delay  = ((urb[4] << 8) | urb[5]);
+		chn->pre_deassert_delay = ((urb[6] << 8) | urb[7]);
 	}
 
 	mutex_unlock(&dev->usb_bus_lock);
@@ -1209,7 +1221,7 @@ static void cp2130_update_otprom(struct work_struct *work)
 	struct cp2130_device *dev = container_of(work,
 						 struct cp2130_device,
 						 update_otprom);
-	char urb[0x14] = { 0 };
+	u8 urb[0x14] = { 0 };
 	int ret;
 	unsigned int xmit_pipe;
 
@@ -1241,7 +1253,7 @@ static void cp2130_update_otprom(struct work_struct *work)
 static void cp2130_read_otprom(struct work_struct *work)
 {
 	int i;
-	char urb[32];
+	u8 urb[32];
 	int ret;
 	unsigned int recv_pipe;
 	struct cp2130_device *dev = container_of(work,
@@ -1265,10 +1277,8 @@ static void cp2130_read_otprom(struct work_struct *work)
 		USB_TYPE_VENDOR | USB_RECIP_DEVICE | USB_DIR_IN,
 		0, 0,
 		urb, 2, 200);
-	dev_info(&dev->udev->dev, "lock byte %02X %02X",
-		 urb[0] & 0xff, urb[1] & 0x0f);
-	dev->otprom_config.lock_byte = urb[0] & 0xff;
-	dev->otprom_config.lock_byte |= (urb[1] & 0x0f) << 8;
+	dev_info(&dev->udev->dev, "lock byte %02X %02X", urb[0], urb[1]);
+	dev->otprom_config.lock_byte = (urb[0] | ((urb[1] & 0x0f) << 8));
 
 	dev_dbg(&dev->udev->dev, "get pin config");
 	ret = usb_control_msg(
@@ -1300,7 +1310,7 @@ static void cp2130_read_otprom(struct work_struct *work)
 static void cp2130_read_gpios(struct work_struct *work)
 {
 	unsigned int recv_pipe;
-	char urb[2];
+	u8 urb[2];
 	struct cp2130_device *dev = container_of(work,
 						 struct cp2130_device,
 						 irq_work);
@@ -1330,9 +1340,9 @@ loop:
 	}
 
 	dev_dbg(&dev->udev->dev, "read gpios 1: %02X",
-		urb[1] & 0xff & ~(1 | 2 | 4));
+		urb[1] & ~((1 << 0) | (1 << 1) | (1 << 2)));
 	dev_dbg(&dev->udev->dev, "read gpios 2: %02X",
-		urb[0] & 0xff & ~(2 | 128));
+		urb[0] & ~((1 << 1) | (1 << 7)));
 
 	for (i = 0; i < CP2130_NUM_GPIOS; ++i) {
 		if (!(dev->irq_chip.irq_mask & (1 << i)))
@@ -1485,7 +1495,7 @@ static int cp2130_gpio_direction_input(struct gpio_chip *gc, unsigned off)
 {
 	struct cp2130_device *dev = gpiochip_get_data(gc);
 	int ret;
-	char urb[8];
+	u8 urb[8];
 	unsigned int xmit_pipe;
 
 	xmit_pipe = usb_sndctrlpipe(dev->udev, 0);
@@ -1512,7 +1522,7 @@ static int cp2130_gpio_direction_output(struct gpio_chip *gc, unsigned off,
 {
 	struct cp2130_device *dev = gpiochip_get_data(gc);
 	int ret;
-	char urb[8];
+	u8 urb[3];
 	unsigned int xmit_pipe;
 
 	xmit_pipe = usb_sndctrlpipe(dev->udev, 0);
@@ -1520,6 +1530,7 @@ static int cp2130_gpio_direction_output(struct gpio_chip *gc, unsigned off,
 	mutex_lock(&dev->usb_bus_lock);
 
 	urb[0] = off;
+	/* TODO: Do we need to support open-drain output? */
 	urb[1] = 2; /* push-pull output */
 	urb[2] = val; /* state */
 	ret = usb_control_msg(
@@ -1638,6 +1649,7 @@ int cp2130_probe(struct usb_interface *intf, const struct usb_device_id *id)
 	spi_master->mode_bits =
 		SPI_MODE_0 | SPI_MODE_1 | SPI_MODE_2 | SPI_MODE_3;
 
+	spi_master->bits_per_word_mask = SPI_BPW_MASK(8);
 	spi_master->flags = 0;
 	spi_master->setup = cp2130_spi_setup;
 	spi_master->cleanup = cp2130_spi_cleanup;
