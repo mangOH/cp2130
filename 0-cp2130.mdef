@@ -1,1 +1,5 @@
-cp2130.mdef
+sources:
+{
+    spi-cp2130.c
+}
+
