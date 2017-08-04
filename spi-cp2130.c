@@ -803,7 +803,6 @@ static int cp2130_spi_transfer_one_message(struct spi_master *master,
 	struct spi_transfer *xfer;
 	struct cp2130_device *dev =
 		(struct cp2130_device*) spi_master_get_devdata(master);
-	u8 ctrl_urb[2] = { 0 };
 	int ret = 0;
 	int len, chn_id;
 	struct cp2130_channel *chn;
@@ -841,17 +840,16 @@ static int cp2130_spi_transfer_one_message(struct spi_master *master,
 
 	xmit_ctrl_pipe = usb_sndctrlpipe(dev->udev, 0);
 	if (chn_id != dev->current_channel) {
+		u8 ctrl_urb[] = { chn_id, chn->cs_en };
 		dev_dbg(&dev->udev->dev, "load setup %d for channel %d",
 			chn->cs_en, chn_id);
-		ctrl_urb[0] = chn_id;
-		ctrl_urb[1] = chn->cs_en;
 		ret = usb_control_msg(
 			dev->udev, xmit_ctrl_pipe,
 			CP2130_BREQ_SET_GPIO_CS,
 			USB_TYPE_VENDOR | USB_RECIP_DEVICE | USB_DIR_OUT,
 			0, 0,
-			ctrl_urb, 2, 200);
-		if (ret < 2)
+			ctrl_urb, sizeof(ctrl_urb), 200);
+		if (ret != sizeof(ctrl_urb))
 			goto err;
 
 		dev->current_channel = chn_id;
@@ -1159,7 +1157,7 @@ error:
 static void cp2130_read_channel_config(struct work_struct *work)
 {
 	int i;
-	u8 urb[32];
+	u8 urb[CP2130_NUM_GPIOS];
 	int ret;
 	unsigned int recv_pipe;
 	struct cp2130_device *dev = container_of(work,
@@ -1183,7 +1181,7 @@ static void cp2130_read_channel_config(struct work_struct *work)
 		CP2130_BREQ_GET_SPI_WORD,
 		USB_TYPE_VENDOR | USB_RECIP_DEVICE | USB_DIR_IN,
 		0, 0,
-		urb, 11, 200);
+		urb, CP2130_NUM_GPIOS, 200);
 
 	for (i = 0; i < CP2130_NUM_GPIOS; i++) {
 		chn = &dev->chn_configs[i];
@@ -1221,7 +1219,7 @@ static void cp2130_update_otprom(struct work_struct *work)
 	struct cp2130_device *dev = container_of(work,
 						 struct cp2130_device,
 						 update_otprom);
-	u8 urb[0x14] = { 0 };
+	u8 urb[20] = { 0 };
 	int ret;
 	unsigned int xmit_pipe;
 
@@ -1232,6 +1230,11 @@ static void cp2130_update_otprom(struct work_struct *work)
 	for (i = 0; i < CP2130_NUM_GPIOS; i++)
 		urb[i] = dev->otprom_config.pin_config[i];
 
+	/*
+	 * TODO: Why aren't we writing these values: suspend_level,
+	 * suspend_mode, wakeup_mask, wakeup_match, divider
+	 */
+
 	mutex_lock(&dev->usb_bus_lock);
 
 	ret = usb_control_msg(
@@ -1239,9 +1242,9 @@ static void cp2130_update_otprom(struct work_struct *work)
 		CP2130_BREQ_SET_PIN_CONFIG,
 		USB_TYPE_VENDOR | USB_RECIP_DEVICE | USB_DIR_OUT,
 		CP2130_WVAL_SET_LOCK_BYTE_MEMORY_KEY, 0,
-		urb, 0x14, 200);
+		urb, sizeof(urb), 200);
 
-	if (ret)
+	if (ret != sizeof(urb))
 		dev_err(&dev->udev->dev, "error writing OTP ROM pin config");
 
 	mutex_unlock(&dev->usb_bus_lock);
@@ -1253,7 +1256,7 @@ static void cp2130_update_otprom(struct work_struct *work)
 static void cp2130_read_otprom(struct work_struct *work)
 {
 	int i;
-	u8 urb[32];
+	u8 urb[20];
 	int ret;
 	unsigned int recv_pipe;
 	struct cp2130_device *dev = container_of(work,
@@ -1286,7 +1289,7 @@ static void cp2130_read_otprom(struct work_struct *work)
 		CP2130_BREQ_GET_PIN_CONFIG,
 		USB_TYPE_VENDOR | USB_RECIP_DEVICE | USB_DIR_IN,
 		0, 0,
-		urb, 0x14, 200);
+		urb, 20, 200);
 
 	for (i = 0; i < CP2130_NUM_GPIOS; ++i) {
 		dev_info(&dev->udev->dev, "pin %d: %02X",
@@ -1328,7 +1331,7 @@ loop:
 		CP2130_BREQ_GET_GPIO_VALUES,
 		USB_TYPE_VENDOR | USB_RECIP_DEVICE | USB_DIR_IN,
 		0, 0,
-		urb, 2, 200);
+		urb, sizeof(urb), 200);
 	mutex_unlock(&dev->usb_bus_lock);
 
 	dev->gpio_states[0] = urb[0];
@@ -1495,26 +1498,27 @@ static int cp2130_gpio_direction_input(struct gpio_chip *gc, unsigned off)
 {
 	struct cp2130_device *dev = gpiochip_get_data(gc);
 	int ret;
-	u8 urb[8];
 	unsigned int xmit_pipe;
+	u8 urb[] = {
+		 off,
+		 0, /* input */
+		 0  /* value, ignored for input */
+	};
 
 	xmit_pipe = usb_sndctrlpipe(dev->udev, 0);
 
 	mutex_lock(&dev->usb_bus_lock);
 
-	urb[0] = off;
-	urb[1] = 0; /* input */
-	urb[2] = 0; /* value, ignored for input */
 	ret = usb_control_msg(
 		dev->udev, xmit_pipe,
 		CP2130_BREQ_SET_GPIO_MODE,
 		USB_TYPE_VENDOR | USB_RECIP_DEVICE | USB_DIR_OUT,
 		0, 0,
-		urb, 3, 200);
+		urb, sizeof(urb), 200);
 
 	mutex_unlock(&dev->usb_bus_lock);
 
-	return (ret == 3) ? 0 : -EIO;
+	return (ret == sizeof(urb)) ? 0 : -EIO;
 }
 
 static int cp2130_gpio_direction_output(struct gpio_chip *gc, unsigned off,
@@ -1522,27 +1526,28 @@ static int cp2130_gpio_direction_output(struct gpio_chip *gc, unsigned off,
 {
 	struct cp2130_device *dev = gpiochip_get_data(gc);
 	int ret;
-	u8 urb[3];
 	unsigned int xmit_pipe;
+	u8 urb[] = {
+		off,
+		/* TODO: Do we need to support open-drain output? */
+		2,   /* push-pull output */
+		val  /* state */
+	};
 
 	xmit_pipe = usb_sndctrlpipe(dev->udev, 0);
 
 	mutex_lock(&dev->usb_bus_lock);
 
-	urb[0] = off;
-	/* TODO: Do we need to support open-drain output? */
-	urb[1] = 2; /* push-pull output */
-	urb[2] = val; /* state */
 	ret = usb_control_msg(
 		dev->udev, xmit_pipe,
 		CP2130_BREQ_SET_GPIO_MODE,
 		USB_TYPE_VENDOR | USB_RECIP_DEVICE | USB_DIR_OUT,
 		0, 0,
-		urb, 3, 200);
+		urb, sizeof(urb), 200);
 
 	mutex_unlock(&dev->usb_bus_lock);
 
-	return (ret == 3) ? 0 : -EIO;
+	return (ret == sizeof(urb)) ? 0 : -EIO;
 }
 
 static int cp2130_gpio_get_value(struct gpio_chip *gc, unsigned off)
