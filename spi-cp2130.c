@@ -165,6 +165,9 @@ struct cp2130_device {
 	struct cp2130_gpio_irq irq_chip;
 	struct work_struct irq_work;
 
+	/* TODO Remove when echo cmd called from instlegato */
+        struct completion update_chn_cfg_compl;
+
 	struct gpio_chip gpio_chip;
 	char *gpio_names[CP2130_NUM_GPIOS];
 	u8 gpio_states[2];
@@ -474,6 +477,12 @@ unlock:
 	mutex_unlock(&chip->chn_config_lock);
 
 out:
+	/* TODO Remove when echo cmd called from instlegato */
+	if (ret != count) {
+		dev_dbg(&udev->dev, "%s(): notify channel config complete\n", __func__);
+		complete(&chip->update_chn_cfg_compl);
+	}
+
 	kfree(lbuf);
 	return ret;
 }
@@ -1139,7 +1148,9 @@ static void cp2130_update_channel_config(struct work_struct *work)
 		if (ret)
 			goto error;
 
-		dev_dbg(&dev->udev->dev, "%s probe complete", chn->modalias);
+		dev_dbg(&dev->udev->dev, 
+			"added SPI device '%s', %s probe complete", 
+			dev_name(&chn->chip->dev), chn->modalias);
 	}
 	mutex_unlock(&dev->chn_config_lock);
 
@@ -1150,6 +1161,10 @@ error_unlock:
 	mutex_unlock(&dev->usb_bus_lock);
 
 error:
+	/* TODO Remove when echo cmd called from instlegato */
+	dev_dbg(&dev->udev->dev, "%s(): notify channel config complete\n", __func__);
+	complete(&dev->update_chn_cfg_compl);
+
 	mutex_unlock(&dev->chn_config_lock);
 	dev_err(&dev->udev->dev, "failed to configure channel %d", i);
 }
@@ -1208,6 +1223,10 @@ static void cp2130_read_channel_config(struct work_struct *work)
 		chn->post_assert_delay  = ((urb[4] << 8) | urb[5]);
 		chn->pre_deassert_delay = ((urb[6] << 8) | urb[7]);
 	}
+
+	/* TODO Remove when echo cmd called from instlegato */
+	dev_dbg(&dev->udev->dev, "%s(): notify channel config complete\n", __func__);
+	complete(&dev->update_chn_cfg_compl);
 
 	mutex_unlock(&dev->usb_bus_lock);
 	mutex_unlock(&dev->chn_config_lock);
@@ -1595,6 +1614,39 @@ static const char* cp2130_gpio_names[] = { "........-_cs0",
 					   "........-_suspend",
 };
 
+int cp2130_update_ch_config(struct spi_master *master, const char* cfg)
+{
+	struct usb_interface *intf;
+	struct cp2130_device *dev;
+	int ret;
+
+	dev = spi_master_get_devdata(master);
+	if (!dev) {
+		dev_err(&master->dev, "spi_master_get_devdata() failed()\n");
+		ret = -EINVAL;
+		goto cleanup;
+	}
+
+	dev_dbg(&master->dev, "update channel config('%s')\n", cfg);
+	reinit_completion(&dev->update_chn_cfg_compl);
+
+	intf = dev->intf;
+	ret = channel_config_store(&intf->dev, NULL, cfg, 1);
+	if (ret < 0) {
+		dev_err(&master->dev, "channel_config_store() failed(%d)\n", ret);
+		goto cleanup;
+ 	}
+
+	/* TODO Remove when echo cmd called from instlegato */
+        wait_for_completion(&dev->update_chn_cfg_compl);
+	dev_dbg(&master->dev, "update channel config complete\n");
+
+cleanup:
+	return ret;
+}
+
+EXPORT_SYMBOL(cp2130_update_ch_config);
+
 int cp2130_probe(struct usb_interface *intf, const struct usb_device_id *id)
 {
 	struct usb_device *udev = usb_get_dev(interface_to_usbdev(intf));
@@ -1731,6 +1783,9 @@ int cp2130_probe(struct usb_interface *intf, const struct usb_device_id *id)
 	INIT_WORK(&dev->read_otprom, cp2130_read_otprom);
 	schedule_work(&dev->read_chn_config);
 	schedule_work(&dev->read_otprom);
+
+	/* TODO Remove when echo cmd called from instlegato */
+        init_completion(&dev->update_chn_cfg_compl);
 
 	return 0;
 
