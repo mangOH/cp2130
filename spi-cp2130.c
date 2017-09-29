@@ -91,6 +91,9 @@
 
 #define CP2130_WVAL_SET_LOCK_BYTE_MEMORY_KEY   0xA5F1
 
+#define CP2130_BULK_WR_FIRST_TRANSFER_MAX_LEN  56
+#define CP2130_BULK_WR_TRANSFER_MAX_LEN	       64
+
 /* cp2130 attached chip */
 struct cp2130_channel {
 	/*
@@ -164,6 +167,15 @@ struct cp2130_device {
 
 	struct cp2130_gpio_irq irq_chip;
 	struct work_struct irq_work;
+
+	struct completion write_completion;
+	struct completion read_completion;
+	struct urb *tx_urb;
+	struct urb *rx_urb;
+	struct cp2130_channel *last_transfer_chn;
+	u8 usb_tx_buffer[CP2130_BULK_WR_TRANSFER_MAX_LEN];
+	unsigned int recv_pipe;
+	unsigned int xmit_pipe;
 
 	/* TODO Remove when echo cmd called from instlegato */
         struct completion update_chn_cfg_compl;
@@ -806,6 +818,12 @@ static void cp2130_read_transfer_completion_handler(struct urb *urb)
 	complete(read_transfer_completion);
 }
 
+static void cp2130_write_transfer_completion_handler(struct urb *urb)
+{
+	struct completion *write_transfer_completion = urb->context;
+	complete(write_transfer_completion);
+}
+
 static int cp2130_spi_transfer_one_message(struct spi_master *master,
 					   struct spi_message *mesg)
 {
@@ -813,221 +831,147 @@ static int cp2130_spi_transfer_one_message(struct spi_master *master,
 	struct cp2130_device *dev =
 		(struct cp2130_device*) spi_master_get_devdata(master);
 	int ret = 0;
-	int len, chn_id;
+	int chn_id;
 	struct cp2130_channel *chn;
-	unsigned int recv_pipe, xmit_pipe;
-	unsigned int xmit_ctrl_pipe;
-	size_t spi_mesg_len = 0;
-	bool spi_mesg_does_tx = false;
-	bool spi_mesg_does_rx = false;
-	u8 *usb_tx_buffer = NULL;
-	u8 *usb_rx_buffer = NULL;
-	size_t usb_tx_buffer_len = 0;
-	size_t usb_rx_buffer_len = 0;
 
 	dev_dbg(&master->dev, "spi transfer one message");
 
-	xmit_pipe = usb_sndbulkpipe(dev->udev, 0x01);
-	recv_pipe = usb_rcvbulkpipe(dev->udev, 0x82);
-
-	dev_dbg(&master->dev, "recv/xmit pipes: %u / %u",
-		recv_pipe, xmit_pipe);
-
-	/* search for spi setup of this device */
-	for (chn_id = 0; chn_id < CP2130_NUM_GPIOS; chn_id++) {
-		chn = &dev->chn_configs[chn_id];
-		if (chn->chip == mesg->spi)
-			break;
-	}
-
 	mutex_lock(&dev->usb_bus_lock);
 
-	if (chn_id == CP2130_NUM_GPIOS) {
-		ret = -EINVAL;
-		goto err;
-	}
+	if (dev->last_transfer_chn && 
+            (dev->last_transfer_chn->chip != mesg->spi)) {
+		/* search for spi setup of this device */
+		for (chn_id = 0; chn_id < CP2130_NUM_GPIOS; chn_id++) {
+			chn = &dev->chn_configs[chn_id];
+			if (chn->chip == mesg->spi) {
+				dev->last_transfer_chn = chn;
+				break;
+			}
+		}
 
-	xmit_ctrl_pipe = usb_sndctrlpipe(dev->udev, 0);
-	if (chn_id != dev->current_channel) {
-		u8 ctrl_urb[] = { chn_id, chn->cs_en };
-		dev_dbg(&dev->udev->dev, "load setup %d for channel %d",
-			chn->cs_en, chn_id);
-		ret = usb_control_msg(
-			dev->udev, xmit_ctrl_pipe,
-			CP2130_BREQ_SET_GPIO_CS,
-			USB_TYPE_VENDOR | USB_RECIP_DEVICE | USB_DIR_OUT,
-			0, 0,
-			ctrl_urb, sizeof(ctrl_urb), 200);
-		if (ret != sizeof(ctrl_urb))
+		if (chn_id == CP2130_NUM_GPIOS) {
+			ret = -EINVAL;
 			goto err;
+		}
 
-		dev->current_channel = chn_id;
+		if (chn_id != dev->current_channel) {
+			u8 ctrl_urb[] = { chn_id, chn->cs_en };
+			unsigned int xmit_ctrl_pipe = usb_sndctrlpipe(dev->udev, 0);
+
+			dev_dbg(&dev->udev->dev, "load setup %d for channel %d",
+				chn->cs_en, chn_id);
+
+			ret = usb_control_msg(
+				dev->udev, xmit_ctrl_pipe,
+				CP2130_BREQ_SET_GPIO_CS,
+				USB_TYPE_VENDOR | USB_RECIP_DEVICE | USB_DIR_OUT,
+				0, 0,
+				ctrl_urb, sizeof(ctrl_urb), 200);
+			if (ret != sizeof(ctrl_urb))
+				goto err;
+
+			dev->current_channel = chn_id;
+		}
 	}
 
-	/*
-	 * The approach taken here is to combine the transfers together into one
-	 * big transfer. This allows us to use the CP2130's Write, Read or
-	 * WriteRead primitive operations and have the chip select automatically
-	 * be controlled around this. The disadvantage of this approach is that
-	 * we don't have the ability to honour any of the delay settings between
-	 * transfers nor can we support the cs_change option. In order to
-	 * implement these features properly, I think the chip select control
-	 * will have to be done using explicit GPIO commands on the control
-	 * endpoint rather than relying on the CP2130 to do it for us. An
-	 * advantage of that approach is that write-then-read transactions where
-	 * the write size is x and the read size is y won't be converted into a
-	 * x + y length bulk out and x + y length bulk in transfer.
-	 */
 	list_for_each_entry(xfer, &mesg->transfers, transfer_list) {
-		spi_mesg_len += xfer->len;
+		dev_dbg(&master->dev, "spi transfer stats: %p, %p, %d",
+			xfer->tx_buf, xfer->rx_buf, xfer->len);
+
+                /* empty transfer */
+                if (!xfer->tx_buf && !xfer->rx_buf) {
+                        udelay(xfer->delay_usecs);
+                        continue;
+		}
+
+		/* init length field */
+		*((u32*)&dev->usb_tx_buffer[CP2130_BULK_OFFSET_LENGTH]) =
+			__cpu_to_le32(xfer->len);
+
+		/* copy SPI data */
 		if (xfer->tx_buf)
-			spi_mesg_does_tx = true;
-		if (xfer->rx_buf)
-			spi_mesg_does_rx = true;
-	}
+			memcpy(&dev->usb_tx_buffer[CP2130_BULK_OFFSET_DATA],
+				xfer->tx_buf, xfer->len);
 
-	if (spi_mesg_len == 0 || (!spi_mesg_does_tx && !spi_mesg_does_rx))
-		goto err;
+		if (xfer->tx_buf && xfer->rx_buf) {
+			/* Use CP2130's WriteRead feature */		
+			dev->usb_tx_buffer[CP2130_BULK_OFFSET_CMD] = CP2130_CMD_WRITEREAD;
 
-	if (spi_mesg_does_tx) {
-		size_t offset;
-		usb_tx_buffer_len = CP2130_BULK_OFFSET_DATA + spi_mesg_len;
-		usb_tx_buffer = kzalloc(usb_tx_buffer_len, GFP_KERNEL);
-		if (usb_tx_buffer == NULL) {
-			ret = -ENOMEM;
-			goto err;
-		}
-		/*
-		 * Copy all of the data from the various tx buffers in the
-		 * spi_message into the correct offset in the consolidated
-		 * usb_tx_buffer.
-		 */
-		offset = CP2130_BULK_OFFSET_DATA;
-		list_for_each_entry(xfer, &mesg->transfers, transfer_list) {
-			if (xfer->tx_buf) {
-				memcpy(&usb_tx_buffer[offset], xfer->tx_buf, xfer->len);
-			}
-			offset += xfer->len;
-		}
-	} else {
-		usb_tx_buffer_len = CP2130_BULK_OFFSET_DATA;
-		usb_tx_buffer = kzalloc(usb_tx_buffer_len, GFP_KERNEL);
-		if (usb_tx_buffer == NULL) {
-			ret = -ENOMEM;
-			goto err;
-		}
-	}
+			usb_fill_bulk_urb(dev->tx_urb, dev->udev, dev->xmit_pipe,
+				  dev->usb_tx_buffer, CP2130_BULK_OFFSET_DATA + xfer->len,
+				  cp2130_write_transfer_completion_handler,
+				  &dev->write_completion);
 
-	if (spi_mesg_does_rx) {
-		usb_rx_buffer_len = spi_mesg_len;
-		usb_rx_buffer = kzalloc(usb_rx_buffer_len, GFP_KERNEL);
-		if (usb_rx_buffer == NULL) {
-			ret = -ENOMEM;
-			goto err;
-		}
-	}
+			if (usb_submit_urb(dev->tx_urb, GFP_ATOMIC) != 0)
+				goto err;
 
-	/* init length field */
-	*((u32*) (usb_tx_buffer + CP2130_BULK_OFFSET_LENGTH)) =
-		__cpu_to_le32(spi_mesg_len);
-
-	if (spi_mesg_does_tx && spi_mesg_does_rx) {
-		/* Use CP2130's WriteRead feature */
-		struct completion read_completion;
-		struct urb *urb = usb_alloc_urb(0, GFP_KERNEL);
-		if (!urb)
-			goto err;
-		usb_tx_buffer[CP2130_BULK_OFFSET_CMD] = CP2130_CMD_WRITEREAD;
-
-		init_completion(&read_completion);
-		usb_fill_bulk_urb(urb, dev->udev, recv_pipe,
-				  usb_rx_buffer, usb_rx_buffer_len,
+			usb_fill_bulk_urb(dev->rx_urb, dev->udev, dev->recv_pipe,
+				  xfer->rx_buf, xfer->len,
 				  cp2130_read_transfer_completion_handler,
-				  &read_completion);
-		if (usb_submit_urb(urb, GFP_KERNEL) != 0)
-		{
-			usb_free_urb(urb);
-			goto err;
-		}
+				  &dev->read_completion);
+			if (usb_submit_urb(dev->rx_urb, GFP_ATOMIC) != 0)
+				goto err;
 
+			wait_for_completion(&dev->write_completion);
+			dev_dbg(&master->dev,
+				"WriteRead - data in transaction: ret=%d, write %d/%d",
+				dev->tx_urb->status, dev->tx_urb->actual_length, xfer->len);
 
-		ret = usb_bulk_msg(dev->udev, xmit_pipe, usb_tx_buffer,
-				   usb_tx_buffer_len, &len, 200);
-		dev_dbg(&master->dev,
-			"WriteRead - data out transaction: ret=%d, wrote %d/%d",
-			ret, len, usb_tx_buffer_len);
-		if (ret)
-			goto err;
+			wait_for_completion(&dev->read_completion);
+			dev_dbg(&master->dev,
+				"WriteRead - data in transaction: ret=%d, read %d/%d",
+				dev->rx_urb->status, dev->rx_urb->actual_length, xfer->len);
+		} else if (!xfer->rx_buf) {
+			/* Use CP2130's Write feature */
+			dev->usb_tx_buffer[CP2130_BULK_OFFSET_CMD] = CP2130_CMD_WRITE;
 
-		wait_for_completion(&read_completion);
-		dev_dbg(&master->dev,
-			"WriteRead - data in transaction: ret=%d, read %d/%d",
-			urb->status, urb->actual_length, usb_rx_buffer_len);
-		usb_free_urb(urb);
-	} else if (spi_mesg_does_tx) {
-		/* Use CP2130's Write feature */
-		usb_tx_buffer[CP2130_BULK_OFFSET_CMD] = CP2130_CMD_WRITE;
-		ret = usb_bulk_msg(dev->udev, xmit_pipe, usb_tx_buffer, usb_tx_buffer_len, &len,
-				   200);
-		dev_dbg(&master->dev,
-			"Write - data out transaction: ret=%d, wrote %d/%d",
-			ret, len, usb_tx_buffer_len);
-		if (ret)
-			goto err;
-	} else if (spi_mesg_does_rx) {
-		/* Use CP2130's Read feature */
-		struct completion read_completion;
-		struct urb *urb = usb_alloc_urb(0, GFP_KERNEL);
-		if (!urb)
-			goto err;
-		usb_tx_buffer[CP2130_BULK_OFFSET_CMD] = CP2130_CMD_READ;
+			usb_fill_bulk_urb(dev->tx_urb, dev->udev, dev->xmit_pipe,
+				  dev->usb_tx_buffer, CP2130_BULK_OFFSET_DATA + xfer->len,
+				  cp2130_write_transfer_completion_handler,
+				  &dev->write_completion);
 
-		init_completion(&read_completion);
-		usb_fill_bulk_urb(urb, dev->udev, recv_pipe,
-				  usb_rx_buffer, usb_rx_buffer_len,
+			if (usb_submit_urb(dev->tx_urb, GFP_ATOMIC) != 0)
+				goto err;
+
+			wait_for_completion(&dev->write_completion);
+			dev_dbg(&master->dev,
+				"Write - data in transaction: ret=%d, write %d/%d",
+				dev->tx_urb->status, dev->tx_urb->actual_length, xfer->len);
+		} else if (!xfer->tx_buf) {
+			/* Use CP2130's Read feature */
+			dev->usb_tx_buffer[CP2130_BULK_OFFSET_CMD] = CP2130_CMD_READ;
+
+			usb_fill_bulk_urb(dev->tx_urb, dev->udev, dev->xmit_pipe,
+				  dev->usb_tx_buffer, CP2130_BULK_OFFSET_DATA,
+				  cp2130_write_transfer_completion_handler,
+				  &dev->write_completion);
+
+			if (usb_submit_urb(dev->tx_urb, GFP_ATOMIC) != 0)
+				goto err;
+
+			usb_fill_bulk_urb(dev->rx_urb, dev->udev, dev->recv_pipe,
+				  xfer->rx_buf, xfer->len,
 				  cp2130_read_transfer_completion_handler,
-				  &read_completion);
-		if (usb_submit_urb(urb, GFP_KERNEL) != 0)
-		{
-			usb_free_urb(urb);
-			goto err;
+				  &dev->read_completion);
+			if (usb_submit_urb(dev->rx_urb, GFP_ATOMIC) != 0)
+				goto err;
+
+			wait_for_completion(&dev->write_completion);
+			dev_dbg(&master->dev,
+				"Read - data in transaction: ret=%d, write %d/%d",
+				dev->tx_urb->status, dev->tx_urb->actual_length, xfer->len);
+
+			wait_for_completion(&dev->read_completion);
+			dev_dbg(&master->dev,
+				"Read - data in transaction: ret=%d, read %d/%d",
+				dev->rx_urb->status, dev->rx_urb->actual_length, xfer->len);
 		}
 
-		ret = usb_bulk_msg(dev->udev, xmit_pipe, usb_tx_buffer,
-				   usb_tx_buffer_len, &len, 200);
-		dev_dbg(&master->dev,
-			"Read - data out transaction: ret=%d, wrote %d/%d",
-			ret, len, usb_tx_buffer_len);
-		if (ret)
-			goto err;
-
-		wait_for_completion(&read_completion);
-		dev_dbg(&master->dev,
-			"Read - data in transaction: ret=%d, read %d/%d",
-			urb->status, urb->actual_length, usb_rx_buffer_len);
-		usb_free_urb(urb);
+		mesg->actual_length += xfer->len;
+		udelay(xfer->delay_usecs);
 	}
 
-	/*
-	 * Move the rx data from the usb buffer into the appropriate rx buffers
-	 * of the spi_mesg.
-	 */
-	if (spi_mesg_does_rx) {
-		size_t offset = 0;
-		list_for_each_entry(xfer, &mesg->transfers, transfer_list) {
-			if (xfer->rx_buf) {
-				memcpy(xfer->rx_buf, &usb_rx_buffer[offset], xfer->len);
-			}
-			offset += xfer->len;
-		}
-	}
-
-	mesg->actual_length += spi_mesg_len;
 err:
-	if (usb_tx_buffer)
-	    kfree(usb_tx_buffer);
-	if (usb_rx_buffer)
-		kfree(usb_rx_buffer);
 	mutex_unlock(&dev->usb_bus_lock);
 	mesg->status = ret;
 	if (ret)
@@ -1675,7 +1619,22 @@ int cp2130_probe(struct usb_interface *intf, const struct usb_device_id *id)
 	mutex_init(&dev->chn_config_lock);
 	mutex_init(&dev->otprom_lock);
 
+	init_completion(&dev->read_completion);
+	init_completion(&dev->write_completion);
+	dev->tx_urb = usb_alloc_urb(0, GFP_KERNEL);
+	if (!dev->tx_urb)
+		goto err_out;
+	dev->rx_urb = usb_alloc_urb(0, GFP_KERNEL);
+	if (!dev->rx_urb)
+		goto err_out;
+
+	dev->last_transfer_chn = NULL;
 	dev->current_channel = -1;
+	dev->xmit_pipe = usb_sndbulkpipe(dev->udev, USB_DIR_OUT | 0x01);
+	dev->recv_pipe = usb_rcvbulkpipe(dev->udev, USB_DIR_IN | 0x02);
+
+	dev_dbg(&udev->dev, "recv/xmit pipes: %u / %u",
+		dev->recv_pipe, dev->xmit_pipe);
 
 	usb_set_intfdata(intf, dev);
 
@@ -1692,7 +1651,6 @@ int cp2130_probe(struct usb_interface *intf, const struct usb_device_id *id)
 	}
 
 	spi_master = spi_alloc_master(&udev->dev, sizeof(void*));
-
 	if (!spi_master)
 		goto err_out;
 
@@ -1713,7 +1671,6 @@ int cp2130_probe(struct usb_interface *intf, const struct usb_device_id *id)
 	spi_master->transfer_one_message = cp2130_spi_transfer_one_message;
 
 	ret = spi_register_master(spi_master);
-
 	if (ret) {
 		dev_err(&udev->dev, "failed to register SPI master");
 		spi_master_put(spi_master);
@@ -1790,6 +1747,10 @@ int cp2130_probe(struct usb_interface *intf, const struct usb_device_id *id)
 	return 0;
 
 err_out:
+	if (dev->tx_urb)
+		usb_free_urb(dev->tx_urb);
+	if (dev->rx_urb)
+		usb_free_urb(dev->rx_urb);
 	if (dev)
 		kfree(dev);
 	if (spi_master)
@@ -1821,6 +1782,8 @@ void cp2130_disconnect(struct usb_interface *intf)
 			   &dev_attr_irq_poll_interval);
 
 	spi_unregister_master(dev->spi_master);
+	usb_free_urb(dev->tx_urb);
+	usb_free_urb(dev->rx_urb);
 }
 
 module_init(cp2130_init);
