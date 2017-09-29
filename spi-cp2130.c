@@ -874,6 +874,10 @@ static int cp2130_spi_transfer_one_message(struct spi_master *master,
 		}
 	}
 
+	/* 
+	 * TODO: Currently this will only work with < 56 bytes transfers
+	 * updates required to loop with > 56 byte transfers. 
+         */
 	list_for_each_entry(xfer, &mesg->transfers, transfer_list) {
 		dev_dbg(&master->dev, "spi transfer stats: %p, %p, %d",
 			xfer->tx_buf, xfer->rx_buf, xfer->len);
